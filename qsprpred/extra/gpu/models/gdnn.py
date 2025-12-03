@@ -28,6 +28,7 @@ from dgl.dataloading import GraphDataLoader
 from dgllife.utils import mol_to_bigraph, CanonicalAtomFeaturizer, CanonicalBondFeaturizer
 import math
 from rdkit import Chem
+from sklearn.metrics import matthews_corrcoef
 
 
 
@@ -41,28 +42,48 @@ class GGNN(nn.Module):
         patience,
         tol,
         parameters,
-        n_class=2
-    ):
+        activation_func,
+        #FIXED added params
+        # n_epochs=5,
+        # lr=None,
+        # batch_size=128,
+        n_class=None
+        ):
     
         super().__init__()
         print("GGNN updated")
 
         self.n_dim = n_dim
         self.n_hidden_layers = parameters['n_hidden_layers']
-        self.dropout = nn.Dropout(parameters['dropout_rate'])
+        #self.dropout = nn.Dropout(parameters['dropout_rate'])
+        self.dropout_rate = parameters['dropout_rate']
         self.in_feats = parameters['in_feats']
         self.n_steps = parameters['n_steps']
         self.n_etypes = parameters['n_etypes']
-        self.out_feats = parameters['n_dim']
+        self.out_feats = parameters['out_feats']
+        self.optim_lr = parameters["optim__lr"]
+        self.optim_wd = parameters["optim__weight_decay"]
+        self.optim_momentum = parameters["optim__momentum"]
+        self.n_epochs = parameters["n_epochs"]
+        self.batch_size = parameters["batch_size"]
+        self.lr = parameters["lr"]
+        self.gamma = parameters["gamma"]
         self.layers = nn.ModuleList()
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        #device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = device
         self.gpus = gpus
-        self.n_cls = n_class
-        self.is_reg = False
+        self.n_class = n_class
+        self.is_reg = is_reg#False
         self.patience = patience
         self.tol = tol
-        
+        self.activation_func = activation_func
+        #FIXED added params
+        # self.lr = lr
+        # self.n_epochs = n_epochs
+        # self.batch_size = batch_size
+        self.dropout = nn.Dropout(self.dropout_rate)
+
+
         for i in range(self.n_hidden_layers):
             if i == 0:
                 set_in_feats = self.in_feats
@@ -75,41 +96,53 @@ class GGNN(nn.Module):
                 n_steps=self.n_steps,
                 n_etypes=self.n_etypes
             )
-            self.layers.append(layer)        
+            self.layers.append(layer)     
         pooling_gate_nn = nn.Linear(self.out_feats, 1)
         self.pooling = GlobalAttentionPooling(pooling_gate_nn) 
-        self.output_layer = nn.Linear(self.out_feats, self.n_cls)
+        self.output_layer = nn.Linear(self.out_feats, self.n_class)
         self.loss_fn = nn.CrossEntropyLoss()
-    def forward(self, graph, features):
-        
 
-        features = features.to(graph.device) 
+    def forward(self, graph, features):
+
+        features = features.to(graph.device)
         
-        h = F.relu(self.layers[0](graph, features))
+        h = self.activation_func(self.layers[0](graph, features))
         h = self.dropout(h)
         for i in range(self.n_hidden_layers):
 
             if i == 0:
                 continue
             else:
-                h = F.relu(self.layers[i](graph, h))  
+                h = self.activation_func(self.layers[i](graph, h))  
                 if i < self.n_hidden_layers - 1:
                     h = self.dropout(h)
         h = self.pooling(graph, h)
         h = self.output_layer(h)
         return h
+    
     def reset_parameters(self):
         for layer in self.children():
             if hasattr(layer, 'reset_parameters'):
                 layer.reset_parameters()
-    def set_parameters(self, parameters):
-        ...
+
+    # def collate(self, samples):
+    #     graphs = [s[0] for s in samples]
+    #     batched_graph = dgl.batch(graphs)
+    #     return batched_graph
         
-    
+    #FIXED returns graphs AND labels if labels == True
     def collate(self, samples): 
-        graphs = [s[0] for s in samples]
-        batched_graph = dgl.batch(graphs)
-        return batched_graph
+        if len(samples[0]) == 2:
+            graphs = [s[0] for s in samples]
+            labels = [s[1] for s in samples]
+            batched_graph = dgl.batch(graphs)
+            labels = torch.tensor(labels)
+            return batched_graph,labels
+        else:
+            graphs = [s[0] for s in samples]
+            batched_graph = dgl.batch(graphs)
+            return batched_graph
+
 
     def getLoader(self, X, y, batch_size, schuffle=True, include_labels=False):
         graphs, labels = [], []
@@ -202,32 +235,44 @@ class GGNN(nn.Module):
             if self.verbose:
                 print(f"Checkpoint saved, mcc: {val_mcc}, loss: {val_loss}, accuracy: {val_acc}")
 
-            
-    def fit(self, X, y, Xval=None, yval=None, monitor=None, num_epochs=0, optimizer=None, criterion=None, scheduler=None, accumulation_steps=2):
+
+    def fit(self, X, y, Xval=None, yval=None, monitor=None, optimizer=None, criterion=None, scheduler=None, accumulation_steps=2):
         print("Fitting...")
 
         #X = X.flatten().tolist()
         #have_val = True
-        train_loader = self.getLoader(X, y, batch_size=128, schuffle=True, include_labels=True)
+        train_loader = self.getLoader(X, y, batch_size=self.batch_size, schuffle=True, include_labels=True)
+        val_loader = None
         if (Xval is not None and yval is not None):
             #have_val = False
-            val_loader = self.getLoader(Xval, yval, batch_size=128, schuffle=False, include_labels=True)
+            val_loader = self.getLoader(Xval, yval, batch_size=self.batch_size, schuffle=False, include_labels=True)
         
         
         train_losses, val_losses = [], []
-        scaler = torch.GradScaler()    
+        scaler = torch.GradScaler("cuda" if torch.cuda.is_available() else "cpu")    
         self.best_weights = self.state_dict()
         best_epoch = 0
-        for epoch in range(num_epochs):
+        #FIXED optimizer and criterion initialized
+
+        optimizer
+      
+        optimizer = optimizer(self.parameters())
+        criterion = criterion()
+        scheduler = scheduler(optimizer=optimizer, gamma=self.gamma)
+
+        for epoch in range(self.n_epochs):
             self.train()
             train_loss = 0.0
             optimizer.zero_grad() 
             for batch_idx, (batched_graph, labels) in enumerate(train_loader):
                 batched_graph, labels = batched_graph.to(self.device), labels.to(self.device) 
                 batched_graph.ndata['h'] = batched_graph.ndata['h'].float().to(self.device)
-                with torch.autocast():    
-                    logits = self(batched_graph, batched_graph.ndata['h'].float())
-                    loss = criterion(logits, labels) / accumulation_steps 
+                #FIXED for my setup (no cuda, only CPU)
+                #with torch.autocast("cuda" if torch.cuda.is_available() else "cpu"):
+                # logits = self(batched_graph, batched_graph.ndata['h'].float())
+                logits = self(batched_graph, batched_graph.ndata['h'].float())
+                loss = criterion(logits, labels) / accumulation_steps 
+                #
                 scaler.scale(loss).backward() 
                 train_loss += loss.item() * accumulation_steps
                 if (batch_idx + 1) % accumulation_steps == 0 or batch_idx == len(train_loader) - 1: 
@@ -247,10 +292,11 @@ class GGNN(nn.Module):
                 with torch.no_grad():  
                     for batched_graph, labels in val_loader:  
                         batched_graph, labels = batched_graph.to(self.device), labels.to(self.device)  
-                        batched_graph.ndata['h'] = batched_graph.ndata['h'].to(self.device) 
-                        with torch.autocast(): 
-                            logits = self(batched_graph, batched_graph.ndata['h'].float())
-                            loss = criterion(logits, labels)    # we compute the loss
+                        batched_graph.ndata['h'] = batched_graph.ndata['h'].to(self.device)
+                        #FIXED for my setup (no cuda, only CPU)
+                        #with torch.autocast(): 
+                        logits = self(batched_graph, batched_graph.ndata['h'].float())
+                        loss = criterion(logits, labels)    # we compute the loss
                         validation_loss += loss          
                         _, predicted = torch.max(logits.data, 1)    
                         num_total += labels.size(0)           
@@ -263,16 +309,23 @@ class GGNN(nn.Module):
                     den = math.sqrt((TP + FP) * (TP + FN) * (TN + FP) * (TN + FN))
                     validation_mcc = num / den if den > 0 else 0
                     validation_loss = validation_loss/len(val_loader)   # we get the average loss
+                    
                     val_losses.append(validation_loss)
                     validation_accuraccy = num_val_correct/num_total    # saving for early stopping
                     if early_stopping:  # checking if early stopping is not None
-                        early_stopping(validation_loss, validation_accuraccy, validation_mcc, self, epoch + 1)
-                        best_epoch = early_stopping.best_epoch
-                        if early_stopping.early_stop:
+                        # early_stopping(validation_loss, validation_accuraccy, validation_mcc, self, epoch + 1)
+                        # best_epoch = early_stopping.best_epoch
+                        # if early_stopping.early_stop:
+                        #     print(f"Early stopping triggered at epoch {epoch + 1}")
+                        #     break
+                        #FIXED early stopping
+                        n_last_epoch_loss = val_losses[-self.patience:]
+                        if self.tol > abs(max(n_last_epoch_loss) - min(n_last_epoch_loss)) and len(val_losses) >= self.patience:
                             print(f"Early stopping triggered at epoch {epoch + 1}")
-                            break
+                            return self, epoch
+                        
                     if (epoch + 1) % 5 == 0 or epoch == 0:
-                        print(f'Epoch {epoch + 1}/{num_epochs} '
+                        print(f'Epoch {epoch + 1}/{self.n_epochs} '
                               f'Train loss: {train_loss:.4f} '
                               f'Val loss: {validation_loss:.4f} '
                               f'Val accuracy: {100 * validation_accuraccy:.2f}% '
@@ -284,10 +337,10 @@ class GGNN(nn.Module):
                 scheduler.step()
                        
         self.load_state_dict(self.best_weights)
-        return self, best_epoch
+        return self, epoch
     
     def predict(self, X):
-        test_loader = self.getLoader(X, y=None, batch_size=128, schuffle=False, include_labels=False)
+        test_loader = self.getLoader(X, y=None, batch_size=self.batch_size, schuffle=False, include_labels=False)
         self.eval()
         all_proba = []
         with torch.no_grad():      
@@ -371,6 +424,10 @@ class DNNModel(QSPRModelPyTorchGPU):
             gpus: list[int] = DEFAULT_TORCH_GPUS,
             patience: int = 50,
             tol: float = 0,
+            optimizer = torch.optim.Adam,
+            criterion = torch.nn.BCELoss,
+            scheduler = torch.optim.lr_scheduler.ExponentialLR,
+            activation_func = F.relu
     ):
         """Initialize a DNNModel model.
 
@@ -402,8 +459,13 @@ class DNNModel(QSPRModelPyTorchGPU):
         self.gpus = None
         self.patience = patience
         self.tol = tol
-        self.nClass = 2
-        self.nDim = parameters['n_dim']
+        self.optimizer = optimizer
+        self.criterion = criterion
+        self.scheduler = scheduler
+        self.activation_func = activation_func
+        self.nClass = None
+        self.nDim = None
+
         super().__init__(
             base_dir,
             alg,
@@ -451,19 +513,25 @@ class DNNModel(QSPRModelPyTorchGPU):
         if self.nClass is None or self.nDim is None:
             return "Uninitialized model."
         # initialize model - GGNN here
+        
         estimator = self.alg(
             n_dim=self.nDim,
             n_class=self.nClass,
             device=str(self.device),
             gpus=self.gpus,
-            is_reg=False,#self.task == ModelTasks.REGRESSION,
+            #FIXED is_reg
+            #is_reg=False,#self.task == ModelTasks.REGRESSION,
+            is_reg=self.task == ModelTasks.REGRESSION,
             patience=self.patience,
             tol=self.tol,
+            #FIXED don't accept any parameters
             parameters=params,
+            activation_func=self.activation_func
         ).to(self.device)
         # set parameters if available and return
-        #new_parameters = self.getParameters(params)
-        #if new_parameters is not None:
+        #FIXED load parameters
+        # new_parameters = self.getParameters(params)
+        # if new_parameters is not None:
         #    estimator.set_params(**new_parameters)
         return estimator
 
@@ -550,6 +618,7 @@ class DNNModel(QSPRModelPyTorchGPU):
             n_splits=1, test_size=0.1, random_state=self.randomState
         )
         X, y = self.convertToNumpy(X, y)
+
         # fit with early stopping
         if self.earlyStopping:
             # split cross validation fold train set into train
@@ -558,12 +627,16 @@ class DNNModel(QSPRModelPyTorchGPU):
             monitor.onFitStart(
                 self, X[train_index, :], y[train_index], X[val_index, :], y[val_index]
             )
+            
             estimator_fit = estimator.fit(
                 X[train_index, :],
                 y[train_index],
                 X[val_index, :],
                 y[val_index],
                 monitor=monitor,
+                optimizer=self.optimizer,
+                criterion=self.criterion,
+                scheduler=self.scheduler,
                 **kwargs,
             )
             monitor.onFitEnd(estimator_fit[0], estimator_fit[1])
