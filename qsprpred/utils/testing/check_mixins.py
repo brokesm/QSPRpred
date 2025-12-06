@@ -289,7 +289,7 @@ class ModelCheckMixIn:
         )
         self.checkOptimization(model, ds, gridsearcher)
         model.cleanFiles()
-        # perform crossvalidation
+        #perform crossvalidation
         score_func = "r2" if model.task.isRegression() else "roc_auc_ovr"
         n_folds = 5
         scores = CrossValAssessor(

@@ -1,6 +1,18 @@
+"""This module holds the base class for DNN models
+as well as fully connected NN subclass.
 """
-At the moment this contains a class for fully-connected DNNs.
-"""
+
+import inspect
+from collections import defaultdict
+
+import numpy as np
+import torch
+from torch import nn, optim
+from torch.nn import functional as f
+from torch.utils.data import DataLoader, TensorDataset
+
+from ....logs import logger
+from ....models.monitors import BaseMonitor, FitMonitor
 
 import os
 from typing import Any, Type
@@ -30,60 +42,300 @@ import math
 from rdkit import Chem
 from sklearn.metrics import matthews_corrcoef
 
-
-
 class GGNN(nn.Module):
+    """Single task DNN classification/regression model.
+
+    It contains four fully connected layers between which are
+    dropout layers for robustness.
+
+    Attributes:
+        n_dim (int): the No. of columns (features) for input tensor
+        n_class (int): the No. of columns (classes) for output tensor.
+        device (torch.cude): device to run the model on
+        gpus (list): list of gpu ids to run the model on
+        n_epochs (int): max number of epochs
+        lr (float): neural net learning rate
+        batch_size (int): batch size for training
+        patience (int): early stopping patience
+        tol (float): early stopping tolerance
+        is_reg (bool): whether the model is for regression or classification
+        neurons_h1 (int): No. of neurons in the first hidden layer
+        neurons_hx (int): No. of neurons in the second hidden layer
+        extra_layer (bool): whether to add an extra hidden layer
+        dropout_frac (float): dropout fraction
+        criterion (torch.nn.Module): the loss function
+        dropout (torch.nn.Module): the dropout layer
+        fc0 (torch.nn.Module): the first fully connected layer
+        fc1 (torch.nn.Module): the second fully connected layer
+        fc2 (torch.nn.Module): the third fully connected layer
+        fc3 (torch.nn.Module): the fourth fully connected layer
+        activation (torch.nn.Module): the activation function
+    """
+
     def __init__(
         self,
         n_dim,
+        n_class,
         device,
         gpus,
-        is_reg,
-        patience,
-        tol,
-        parameters,
-        activation_func,
-        #FIXED added params
-        # n_epochs=5,
-        # lr=None,
-        # batch_size=128,
-        n_class=None
-        ):
-    
-        super().__init__()
+        activation_in=None,
+        optim=None,
+        scheduler=None,
+        n_epochs=5,
+        batch_size=128,
+        patience=5,
+        tol=0.001,
+        is_reg=True,
+        in_feats=74,
+        out_feats=74,
+        n_hidden_layers=2,
+        dropout_rate=0.25,
+        steps=3,
+        etypes=1,
+        optim_lr=1e-4,
+        optim_momentum=None,
+        optim_dampening=None,
+        optim_weight_decay=None,
+        optim_nesterov=None,
+        optim_maximize=None,
+        optim_foreach=None,
+        optim_differentiable=None,
+        optim_fused=None,
+        optim_alpha=None,
+        optim_eps=None,
+        optim_centered=None,
+        optim_capturable=None,
+        optim_betas=None,
+        optim_amsgrad=None,
+        scheduler_last_epoch=None,
+        scheduler_gamma=0.95,
+        scheduler_step_size=2,
+        scheduler_milestones=[2,4,6],
+        scheduler_mode=None,
+        scheduler_factor=None,
+        scheduler_patience=None,
+        scheduler_threshold=None,
+        scheduler_threshold_mode=None,
+        scheduler_cooldown=None,
+        scheduler_min_lr=None,
+        scheduler_eps=None,
+        scheduler_T_max=5,
+        scheduler_eta_min=None,
+    ):
+        """Initialize the STFullyConnected model.
+
+        Args:
+            n_dim (int):
+                the No. of columns (features) for input tensor
+            n_class (int):
+                the No. of columns (classes) for output tensor.
+            device (torch.cude):
+                device to run the model on
+            gpus (list):
+                list of gpu ids to run the model on
+            n_epochs (int):
+                max number of epochs
+            lr (float):
+                neural net learning rate
+            batch_size (int):
+                batch size
+            patience (int):
+                number of epochs to wait before early stop if no progress on
+                validation set score, if patience = -1, always train to n_epochs
+            tol (float):
+                minimum absolute improvement of loss necessary to
+                count as progress on best validation score
+            is_reg (bool, optional):
+                Regression model (True) or Classification model (False)
+            neurons_h1 (int):
+                number of neurons in first hidden layer
+            neurons_hx (int):
+                number of neurons in other hidden layers
+            extra_layer (bool):
+                add third hidden layer
+            dropout_frac (float):
+                dropout fraction
+        """
         print("GGNN updated")
 
-        self.n_dim = n_dim
-        self.n_hidden_layers = parameters['n_hidden_layers']
-        #self.dropout = nn.Dropout(parameters['dropout_rate'])
-        self.dropout_rate = parameters['dropout_rate']
-        self.in_feats = parameters['in_feats']
-        self.n_steps = parameters['n_steps']
-        self.n_etypes = parameters['n_etypes']
-        self.out_feats = parameters['out_feats']
-        self.optim_lr = parameters["optim__lr"]
-        self.optim_wd = parameters["optim__weight_decay"]
-        self.optim_momentum = parameters["optim__momentum"]
-        self.n_epochs = parameters["n_epochs"]
-        self.batch_size = parameters["batch_size"]
-        self.lr = parameters["lr"]
-        self.gamma = parameters["gamma"]
-        self.layers = nn.ModuleList()
-        #device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.device = device
+        super().__init__()
+        self.device = torch.device(device)
         self.gpus = gpus
-        self.n_class = n_class
-        self.is_reg = is_reg#False
+        self.n_dim = n_dim
+        self.is_reg = is_reg
+        self.n_class = n_class if not self.is_reg else 1
+        self.in_feats = in_feats
+        self.out_feats = out_feats
+        self.n_hidden_layers = n_hidden_layers
+        self.dropout_rate = dropout_rate
+        self.batch_size = batch_size
+        self.n_epochs = n_epochs
+        self.steps = steps
+        self.etypes = etypes
         self.patience = patience
         self.tol = tol
-        self.activation_func = activation_func
-        #FIXED added params
-        # self.lr = lr
-        # self.n_epochs = n_epochs
-        # self.batch_size = batch_size
+        self.dropout = None
+        self.activation_out = None
+        self.activation_in = activation_in
+        self.optim = optim
+        self.scheduler = scheduler
+        self.optim_lr=optim_lr
+        self.optim_momentum=optim_momentum
+        self.optim_dampening=optim_dampening
+        self.optim_weight_decay=optim_weight_decay
+        self.optim_nesterov=optim_nesterov
+        self.optim_maximize=optim_maximize
+        self.optim_foreach=optim_foreach
+        self.optim_differentiable=optim_differentiable
+        self.optim_fused=optim_fused
+        self.optim_alpha=optim_alpha
+        self.optim_eps=optim_eps
+        self.optim_centered=optim_centered
+        self.optim_capturable=optim_capturable
+        self.optim_betas=optim_betas
+        self.optim_amsgrad=optim_amsgrad
+        self.scheduler_last_epoch=scheduler_last_epoch
+        self.scheduler_gamma=scheduler_gamma
+        self.scheduler_step_size=scheduler_step_size
+        self.scheduler_milestones=scheduler_milestones
+        self.scheduler_mode=scheduler_mode
+        self.scheduler_factor=scheduler_factor
+        self.scheduler_patience=scheduler_patience
+        self.scheduler_threshold=scheduler_threshold
+        self.scheduler_threshold_mode=scheduler_threshold_mode
+        self.scheduler_cooldown=scheduler_cooldown
+        self.scheduler_min_lr=scheduler_min_lr
+        self.scheduler_eps=scheduler_eps
+        self.scheduler_T_max=scheduler_T_max if not None else n_epochs
+        self.scheduler_eta_min=scheduler_eta_min
+        self.optim_kwargs=None
+        self.scheduler_kwargs=None
+        self.layers = nn.ModuleList()
+        if len(self.gpus) > 1:
+            logger.warning(
+                f"At the moment multiple gpus is not possible: "
+                f"running DNN on gpu: {gpus[0]}."
+            )
+
+
+    def getActivationFunc(self):
+        supported = {
+            "relu": F.relu,
+            "selu": F.selu,
+            "leaky_relu": F.leaky_relu,
+            "tanh": torch.tanh
+        }
+
+        if self.activation_in is None:
+            return F.relu
+
+        if not isinstance(self.activation_in, str):
+            raise ValueError(
+                "Activation function has to be a string. \n" \
+                f"Supported activation functions: {list(supported.keys())}"
+            ) 
+
+        if self.activation_in not in supported.keys():
+            raise ValueError(
+                "Invalid argument provided.\n" \
+                f"{self.activation_in} is not supported."
+            )
+        
+        return supported[self.activation_in]
+    
+    def getOptimizer(self):
+        supported = {
+            "adam": torch.optim.Adam,
+            "sgd": torch.optim.SGD,
+            "rmsprop": torch.optim.RMSprop,
+            "adamw": torch.optim.AdamW,
+        }
+
+        signature = inspect.signature(supported[self.optim].__init__) \
+        if self.optim is not None \
+        else inspect.signature(torch.optim.Adam.__init__)
+
+        kwargs = {param.name: param.default for param in signature.parameters.values() if param.default is not param.empty}
+        signature_GGNN = inspect.signature(self.__init__)
+
+        to_update = {
+            ggnn_param.name.split("optim_")[1]: getattr(self, ggnn_param.name) 
+            for ggnn_param in signature_GGNN.parameters.values() 
+            if ggnn_param.name.startswith("optim_") 
+                and getattr(self,ggnn_param.name) is not None
+                and ggnn_param.name.split("optim_")[1] in kwargs.keys()
+                    }
+        
+        kwargs.update(to_update)
+
+        if self.optim is None:
+            return torch.optim.Adam, kwargs
+
+        if not isinstance(self.optim, str):
+            raise ValueError(
+                "Optimizer has to be a string.\n" \
+                f"Supported optimizers: {list(supported.keys())}"
+            ) 
+
+        if self.optim not in supported.keys():
+            raise ValueError(
+                "Invalid argument provided.\n" \
+                f"{self.optim} is not supported." \
+                f"\nSupported optimizers: {list(supported.keys())}"
+            )
+        
+        return supported[self.optim], kwargs
+    
+    def getScheduler(self):
+        supported = {
+            "exp": torch.optim.lr_scheduler.ExponentialLR,
+            "step": torch.optim.lr_scheduler.StepLR,
+            "multi_step": torch.optim.lr_scheduler.MultiStepLR,
+            "reduce_on_plateau": torch.optim.lr_scheduler.ReduceLROnPlateau,
+            "cosine": torch.optim.lr_scheduler.CosineAnnealingLR,
+            
+        }
+
+        if self.scheduler is None:
+            return None, None
+
+        signature = inspect.signature(supported[self.scheduler].__init__)
+
+        kwargs = {param.name: param.default for param in signature.parameters.values() if param.name != "self" and param.name != "optimizer"}
+        signature_GGNN = inspect.signature(self.__init__)
+
+        to_update = {
+            ggnn_param.name.split("scheduler_")[1]: getattr(self, ggnn_param.name) 
+            for ggnn_param in signature_GGNN.parameters.values() 
+            if ggnn_param.name.startswith("scheduler_") 
+                and getattr(self,ggnn_param.name) is not None
+                and ggnn_param.name.split("scheduler_")[1] in kwargs.keys()
+                    }
+
+        kwargs.update(to_update)
+
+        if not isinstance(self.scheduler, str):
+            raise ValueError(
+                "Scheduler has to be a string.\n" \
+                f"Supported schedulers: {list(supported.keys())}"
+            ) 
+
+        if self.scheduler not in supported.keys():
+            raise ValueError(
+                "Invalid argument provided.\n" \
+                f"{self.scheduler} is not supported." \
+                f"\nSupported schedulers: {list(supported.keys())}"
+            )
+        
+        return supported[self.scheduler], kwargs
+        
+    def initModel(self):
+        """Define the layers of the model."""
         self.dropout = nn.Dropout(self.dropout_rate)
-
-
+        self.activation_in = self.getActivationFunc()
+        self.optim, self.optim_kwargs = self.getOptimizer()
+        self.scheduler, self.scheduler_kwargs = self.getScheduler()
+        
         for i in range(self.n_hidden_layers):
             if i == 0:
                 set_in_feats = self.in_feats
@@ -93,50 +345,142 @@ class GGNN(nn.Module):
             layer = GatedGraphConv(
                 in_feats=set_in_feats,
                 out_feats=self.out_feats,
-                n_steps=self.n_steps,
-                n_etypes=self.n_etypes
+                n_steps=self.steps,
+                n_etypes=self.etypes
             )
-            self.layers.append(layer)     
+            self.layers.append(layer)  
         pooling_gate_nn = nn.Linear(self.out_feats, 1)
         self.pooling = GlobalAttentionPooling(pooling_gate_nn) 
         self.output_layer = nn.Linear(self.out_feats, self.n_class)
-        self.loss_fn = nn.CrossEntropyLoss()
 
-    def forward(self, graph, features):
+        if self.is_reg:
+            # loss function for regression
+            self.criterion = nn.MSELoss()
+        elif self.n_class == 1:
+            # loss and activation function of output layer for binary classification
+            self.criterion = nn.BCELoss()
+            self.activation_out = nn.Sigmoid()
+        else:
+            # loss and activation function of output layer for multiple classification
+            self.criterion = nn.CrossEntropyLoss()
+            self.activation_out = nn.Softmax(dim=1)
+
+    @classmethod
+    def _get_param_names(cls) -> list:
+        """Get the class parameter names.
+
+        Function copied from sklearn.base_estimator!
+
+        Returns:
+            parameter names (list): list of the class parameter names.
+        """
+        init_signature = inspect.signature(cls.__init__)
+        parameters = [
+            p
+            for p in init_signature.parameters.values()
+            if p.name != "self" and p.kind != p.VAR_KEYWORD
+        ]
+        return sorted([p.name for p in parameters])
+
+    def get_params(self, deep=True) -> dict:
+        """Get parameters for this estimator.
+
+        Function copied from sklearn.base_estimator!
+
+        Args:
+            deep (bool): If True, will return the parameters for this estimator
+
+        Returns:
+            params (dict): Parameter names mapped to their values.
+        """
+        out = {}
+        for key in self._get_param_names():
+            value = getattr(self, key)
+            if deep and hasattr(value, "get_params"):
+                deep_items = value.get_params().items()
+                out.update((key + "__" + k, val) for k, val in deep_items)
+            out[key] = value
+        return out
+
+    def set_params(self, **params):
+        """Set the parameters of this estimator.
+
+        Function copied from sklearn.base_estimator!
+        The method works on simple estimators as well as on nested objects
+        (such as :class:`~sklearn.pipeline.Pipeline`). The latter have
+        parameters of the form ``<component>__<parameter>`` so that it's
+        possible to update each component of a nested object.
+
+        Args:
+            **params : dict Estimator parameters.
+
+        Returns:
+            self : estimator instance
+        """
+        if not params:
+            # Simple optimization to gain speed (inspect is slow)
+            return self
+        valid_params = self.get_params(deep=True)
+        # grouped by prefix
+        nested_params = defaultdict(dict)
+        for key, value in params.items():
+            key, delim, sub_key = key.partition("__")
+            if key not in valid_params:
+                local_valid_params = self._get_param_names()
+                raise ValueError(
+                    f"Invalid parameter {key!r} for estimator {self}. "
+                    f"Valid parameters are: {local_valid_params!r}."
+                )
+            if delim:
+                nested_params[key][sub_key] = value
+            else:
+                setattr(self, key, value)
+                valid_params[key] = value
+        for key, sub_params in nested_params.items():
+            valid_params[key].set_params(**sub_params)
+        self.initModel()
+        return self
+
+    def forward(self, graph, features) -> torch.Tensor:
+        """Invoke the class directly as a function.
+
+        Args:
+            X (FloatTensor):
+                m X n FloatTensor, m is the No. of samples, n is
+                the No. of features.
+            is_train (bool, optional):
+                is it invoked during training process (True) or
+                just for prediction (False)
+        Returns:
+            y (FloatTensor): m X n FloatTensor, m is the No. of samples,
+                n is the No. of classes
+        """
 
         features = features.to(graph.device)
-        
-        h = self.activation_func(self.layers[0](graph, features))
+        h = self.activation_in(self.layers[0](graph, features))
         h = self.dropout(h)
         for i in range(self.n_hidden_layers):
-
             if i == 0:
                 continue
             else:
-                h = self.activation_func(self.layers[i](graph, h))  
+                h = self.activation_in(self.layers[i](graph, h))  
                 if i < self.n_hidden_layers - 1:
                     h = self.dropout(h)
-        h = self.pooling(graph, h)
-        h = self.output_layer(h)
-        return h
-    
-    def reset_parameters(self):
-        for layer in self.children():
-            if hasattr(layer, 'reset_parameters'):
-                layer.reset_parameters()
 
-    # def collate(self, samples):
-    #     graphs = [s[0] for s in samples]
-    #     batched_graph = dgl.batch(graphs)
-    #     return batched_graph
-        
-    #FIXED returns graphs AND labels if labels == True
+        h = self.pooling(graph, h)
+        if self.is_reg:
+            return self.output_layer(h)
+        return self.activation_out(self.output_layer(h))
+
     def collate(self, samples): 
         if len(samples[0]) == 2:
             graphs = [s[0] for s in samples]
             labels = [s[1] for s in samples]
             batched_graph = dgl.batch(graphs)
-            labels = torch.tensor(labels)
+            if self.is_reg:
+                labels = torch.tensor(labels,dtype=torch.float32)
+            else:
+                labels = torch.tensor(labels,dtype=torch.int64)
             return batched_graph,labels
         else:
             graphs = [s[0] for s in samples]
@@ -144,12 +488,13 @@ class GGNN(nn.Module):
             return batched_graph
 
 
-    def getLoader(self, X, y, batch_size, schuffle=True, include_labels=False):
+    def getLoader(self, X, y, batch_size, schuffle=False, include_labels=False):
         graphs, labels = [], []
         for i in range(len(X)):
 
             smiles = X[i][0]
             mol = Chem.MolFromSmiles(smiles)
+
             if mol is None:
                 print(f"[WARNING] Skipping invalid SMILES at index {i}: {smiles}")
                 continue
@@ -165,7 +510,7 @@ class GGNN(nn.Module):
                 label = y[i]
                 labels.append(label)
         if include_labels:
-            labels = torch.tensor(labels).unsqueeze(1).squeeze()
+            labels = torch.tensor(labels).unsqueeze(1)
 
             loader = GraphDataLoader(
                 list(zip(graphs, labels)),
@@ -182,180 +527,119 @@ class GGNN(nn.Module):
                 num_workers=0)
         return loader
     
-    class EarlyStopping():
-        def __init__(
-            self,
-            patience_loss=10,
-            patience_mcc=10,
-            verbose=True,
-            delta_loss=0.001,
-            delta_mcc=0.001,
-        ):
-            self.patience_loss = patience_loss
-            self.patience_mcc = patience_mcc
-            self.verbose = verbose
-            self.loss_counter = 0
-            self.mcc_counter = 0
-            self.best_loss = np.inf
-            self.best_mcc = -1     
-            self.early_stop = False           
-            self.delta_loss = 0.001
-            self.delta_mcc = 0.001
-            self.best_epoch = 0
-        def __call__(self, val_loss, val_acc, val_mcc, model, epoch):   
-            improved_loss = False
-            improved_mcc = False
 
-            if val_loss < self.best_loss - self.delta_loss:  
-                self.best_loss = val_loss   
-                self.loss_counter = 0  
-                improved_loss = True
-            else:
-                self.loss_counter += 1
-
-            if val_mcc > self.best_mcc + self.delta_mcc:
-                self.best_mcc = val_mcc
-                self.mcc_counter = 0
-                improved_mcc = True
-            else:
-                self.mcc_counter += 1
-
-            if improved_loss or improved_mcc:  
-                self.save_checkpoint(model, val_loss, val_mcc, val_acc)
-                self.best_epoch = epoch
-
-            if self.loss_counter >= self.patience_loss and self.mcc_counter >= self.patience_mcc: #
-                self.early_stop = True
-                if self.verbose:
-                    print("Early stopping triggered.")
-
-        def save_checkpoint(self, model, val_loss, val_mcc, val_acc):
-            self.best_weights = self.state_dict()
-            torch.save(model.state_dict(), "ggnn_checkpoint.pt")
-            if self.verbose:
-                print(f"Checkpoint saved, mcc: {val_mcc}, loss: {val_loss}, accuracy: {val_acc}")
-
-
-    def fit(self, X, y, Xval=None, yval=None, monitor=None, optimizer=None, criterion=None, scheduler=None, accumulation_steps=2):
+    def fit(self, X, y, Xval=None, yval=None, monitor=None):
         print("Fitting...")
 
-        #X = X.flatten().tolist()
-        #have_val = True
-        train_loader = self.getLoader(X, y, batch_size=self.batch_size, schuffle=True, include_labels=True)
+        self.to(self.device)
+        monitor = BaseMonitor() if monitor is None else monitor
+
+        train_loader = self.getLoader(X, y, batch_size=self.batch_size, schuffle=False, include_labels=True)
         val_loader = None
         if (Xval is not None and yval is not None):
-            #have_val = False
             val_loader = self.getLoader(Xval, yval, batch_size=self.batch_size, schuffle=False, include_labels=True)
-        
-        
-        train_losses, val_losses = [], []
-        scaler = torch.GradScaler("cuda" if torch.cuda.is_available() else "cpu")    
-        self.best_weights = self.state_dict()
-        best_epoch = 0
-        #FIXED optimizer and criterion initialized
+            patience = self.patience
+        else:
+            patience = -1
 
-        optimizer
-      
-        optimizer = optimizer(self.parameters())
-        criterion = criterion()
-        scheduler = scheduler(optimizer=optimizer, gamma=self.gamma)
-
+        optimizer = self.optim(self.parameters(), **self.optim_kwargs)
+        scheduler = self.scheduler(optimizer, **self.scheduler_kwargs) if self.scheduler is not None else None
+        
+        scaler = torch.GradScaler(self.device)    
+        best_loss = np.inf
+        best_weights = self.state_dict()
+        last_save = 0  # record the epoch when optimal model is saved.
         for epoch in range(self.n_epochs):
             self.train()
-            train_loss = 0.0
-            optimizer.zero_grad() 
-            for batch_idx, (batched_graph, labels) in enumerate(train_loader):
-                batched_graph, labels = batched_graph.to(self.device), labels.to(self.device) 
+            optimizer.zero_grad()
+            monitor.onEpochStart(epoch)
+            loss = None
+            for batch_idx, (batched_graph, target) in enumerate(train_loader):
+                monitor.onBatchStart(batch_idx)
+                # Batch of target tenor and label tensor
+                batched_graph, target = batched_graph.to(self.device), target.to(self.device)
                 batched_graph.ndata['h'] = batched_graph.ndata['h'].float().to(self.device)
-                #FIXED for my setup (no cuda, only CPU)
-                #with torch.autocast("cuda" if torch.cuda.is_available() else "cpu"):
-                # logits = self(batched_graph, batched_graph.ndata['h'].float())
-                logits = self(batched_graph, batched_graph.ndata['h'].float())
-                loss = criterion(logits, labels) / accumulation_steps 
-                #
-                scaler.scale(loss).backward() 
-                train_loss += loss.item() * accumulation_steps
-                if (batch_idx + 1) % accumulation_steps == 0 or batch_idx == len(train_loader) - 1: 
-                    scaler.step(optimizer) 
-                    scaler.update()  
-                    optimizer.zero_grad() 
-            train_loss = train_loss/len(train_loader)
-            train_losses.append(train_loss)
+                # predicted probability tensor
+                logits = self.forward(batched_graph, batched_graph.ndata['h'].float())
 
-            validation_loss = 0.0
-            validation_accuraccy = 0.0
-            num_val_correct = 0   
-            num_total = 0            
-            TP, TN, FP, FN = 0, 0, 0, 0
-            if val_loader is not None:  
-                self.eval()
-                with torch.no_grad():  
-                    for batched_graph, labels in val_loader:  
-                        batched_graph, labels = batched_graph.to(self.device), labels.to(self.device)  
-                        batched_graph.ndata['h'] = batched_graph.ndata['h'].to(self.device)
-                        #FIXED for my setup (no cuda, only CPU)
-                        #with torch.autocast(): 
-                        logits = self(batched_graph, batched_graph.ndata['h'].float())
-                        loss = criterion(logits, labels)    # we compute the loss
-                        validation_loss += loss          
-                        _, predicted = torch.max(logits.data, 1)    
-                        num_total += labels.size(0)           
-                        num_val_correct += (predicted == labels).sum().item()   
-                        TP += ((predicted == 1) & (labels == 1)).sum().item()
-                        TN += ((predicted == 0) & (labels == 0)).sum().item()
-                        FP += ((predicted == 1) & (labels == 0)).sum().item()
-                        FN += ((predicted == 0) & (labels == 1)).sum().item()
-                    num = TP * TN - FP * FN
-                    den = math.sqrt((TP + FP) * (TP + FN) * (TN + FP) * (TN + FN))
-                    validation_mcc = num / den if den > 0 else 0
-                    validation_loss = validation_loss/len(val_loader)   # we get the average loss
+                if self.n_class > 1:
+                    loss = self.criterion(logits, target.long())
+                else:
+                    loss = self.criterion(logits.squeeze(), target)
+
+                scaler.scale(loss).backward() 
+                scaler.step(optimizer) 
+                scaler.update()  
+                optimizer.zero_grad() 
+                monitor.onBatchEnd(batch_idx, float(loss))
+            if patience == -1:
+                monitor.onEpochEnd(epoch, loss.item())
+            else:
+                # loss value on validation set based on which optimal model is saved.
+                loss_valid = self.evaluate(val_loader)
+                if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    scheduler.step(loss_valid)
+                elif scheduler is not None: 
+                    scheduler.step()
                     
-                    val_losses.append(validation_loss)
-                    validation_accuraccy = num_val_correct/num_total    # saving for early stopping
-                    if early_stopping:  # checking if early stopping is not None
-                        # early_stopping(validation_loss, validation_accuraccy, validation_mcc, self, epoch + 1)
-                        # best_epoch = early_stopping.best_epoch
-                        # if early_stopping.early_stop:
-                        #     print(f"Early stopping triggered at epoch {epoch + 1}")
-                        #     break
-                        #FIXED early stopping
-                        n_last_epoch_loss = val_losses[-self.patience:]
-                        if self.tol > abs(max(n_last_epoch_loss) - min(n_last_epoch_loss)) and len(val_losses) >= self.patience:
-                            print(f"Early stopping triggered at epoch {epoch + 1}")
-                            return self, epoch
-                        
-                    if (epoch + 1) % 5 == 0 or epoch == 0:
-                        print(f'Epoch {epoch + 1}/{self.n_epochs} '
-                              f'Train loss: {train_loss:.4f} '
-                              f'Val loss: {validation_loss:.4f} '
-                              f'Val accuracy: {100 * validation_accuraccy:.2f}% '
-                              f'MCC: {validation_mcc}')
-                        
-            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                scheduler.step(validation_loss)
-            elif scheduler is not None: 
-                scheduler.step()
-                       
-        self.load_state_dict(self.best_weights)
-        return self, epoch
+                if loss_valid + self.tol < best_loss:
+                    best_weights = self.state_dict()
+                    best_loss = loss_valid
+                    last_save = epoch
+                elif epoch - last_save > patience:  # early stop
+                    break
+                monitor.onEpochEnd(epoch, loss.item(), loss_valid)
+
+        if patience == -1:
+            best_weights = self.state_dict()
+        self.load_state_dict(best_weights)
+        return self, last_save
     
     def predict(self, X):
         test_loader = self.getLoader(X, y=None, batch_size=self.batch_size, schuffle=False, include_labels=False)
         self.eval()
-        all_proba = []
+        score = []
         with torch.no_grad():      
             for batched_graph in test_loader:       
                 batched_graph = batched_graph.to(self.device)   
                 node_features = batched_graph.ndata['h'].to(self.device).float()
-                logits = self(batched_graph, node_features)
+                logits = self.forward(batched_graph, node_features.float())
 
-                proba = torch.softmax(logits, dim=1)
+                score.append(logits.detach().cpu())
+        score = torch.cat(score, dim=0).numpy()
+        return score
+    
+    def evaluate(self, loader) -> float:
+        """Evaluate the performance of the DNN model.
 
-                all_proba.append(proba.cpu().numpy())
-        all_proba = np.vstack(all_proba)
-        return all_proba
+        Args:
+            loader (torch.util.data.DataLoader):
+                data loader for test set,
+                including m X n target FloatTensor and l X n label FloatTensor
+                (m is the No. of sample, n is the No. of features, l is the
+                No. of classes or tasks)
 
-
+        Return:
+            loss (float):
+                the average loss value based on the calculation of loss
+                function with given test set.
+        """
+        self.to(self.device)
+        self.eval()
+        loss = 0
+        with torch.no_grad():
+            for batched_graph, target in loader:
+                batched_graph, target = batched_graph.to(self.device), target.to(self.device)
+                batched_graph.ndata["h"] = batched_graph.ndata["h"].float().to(self.device)
+                logits = self.forward(batched_graph, batched_graph.ndata['h'].float())
+                print("Standard dev:",np.std(logits.tolist()))
+                if self.n_class > 1:
+                    loss += self.criterion(logits.squeeze(), target.long()).item()
+                else:
+                    loss += self.criterion(logits.squeeze(), target).item()
+        loss = loss / len(loader)
+        print("Val loss:",loss)
+        return loss
 
 
 class DNNModel(QSPRModelPyTorchGPU):
@@ -410,7 +694,7 @@ class DNNModel(QSPRModelPyTorchGPU):
 
     def setDevice(self, device: str):
         self.device = torch.device(device)
-        if isinstance(self.estimator, Base):
+        if isinstance(self.estimator, nn.Module):
             self.estimator.device = self.device
 
     def __init__(
@@ -423,11 +707,7 @@ class DNNModel(QSPRModelPyTorchGPU):
             autoload: bool = True,
             gpus: list[int] = DEFAULT_TORCH_GPUS,
             patience: int = 50,
-            tol: float = 0,
-            optimizer = torch.optim.Adam,
-            criterion = torch.nn.BCELoss,
-            scheduler = torch.optim.lr_scheduler.ExponentialLR,
-            activation_func = F.relu
+            tol: float = 0
     ):
         """Initialize a DNNModel model.
 
@@ -454,18 +734,15 @@ class DNNModel(QSPRModelPyTorchGPU):
                 minimum absolute improvement of loss necessary to count as progress
                 on best validation score. Defaults to 0.
         """
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.device = device
+
+        # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = None
         self.gpus = None
         self.patience = patience
         self.tol = tol
-        self.optimizer = optimizer
-        self.criterion = criterion
-        self.scheduler = scheduler
-        self.activation_func = activation_func
         self.nClass = None
         self.nDim = None
-
+                
         super().__init__(
             base_dir,
             alg,
@@ -475,6 +752,7 @@ class DNNModel(QSPRModelPyTorchGPU):
             random_state=random_state,
         )
         self.setGPUs(gpus)
+
 
     def initRandomState(self, random_state):
         """Set random state if applicable.
@@ -519,20 +797,16 @@ class DNNModel(QSPRModelPyTorchGPU):
             n_class=self.nClass,
             device=str(self.device),
             gpus=self.gpus,
-            #FIXED is_reg
-            #is_reg=False,#self.task == ModelTasks.REGRESSION,
             is_reg=self.task == ModelTasks.REGRESSION,
             patience=self.patience,
-            tol=self.tol,
-            #FIXED don't accept any parameters
-            parameters=params,
-            activation_func=self.activation_func
+            tol=self.tol
         ).to(self.device)
         # set parameters if available and return
-        #FIXED load parameters
-        # new_parameters = self.getParameters(params)
-        # if new_parameters is not None:
-        #    estimator.set_params(**new_parameters)
+
+        new_parameters = self.getParameters(params)
+        if new_parameters is not None:
+           estimator.set_params(**new_parameters)
+        # estimator.initModel()
         return estimator
 
     def loadEstimatorFromFile(
@@ -634,9 +908,6 @@ class DNNModel(QSPRModelPyTorchGPU):
                 X[val_index, :],
                 y[val_index],
                 monitor=monitor,
-                optimizer=self.optimizer,
-                criterion=self.criterion,
-                scheduler=self.scheduler,
                 **kwargs,
             )
             monitor.onFitEnd(estimator_fit[0], estimator_fit[1])
@@ -644,7 +915,7 @@ class DNNModel(QSPRModelPyTorchGPU):
         monitor.onFitStart(self, X, y)
         # set fixed number of epochs if early stopping is not used
         estimator.n_epochs = self.earlyStopping.getEpochs()
-        estimator_fit = estimator.fit(X, y, monitor=monitor, **kwargs)
+        estimator_fit = estimator.fit(X, y, monitor=monitor,**kwargs)
         monitor.onFitEnd(estimator_fit[0])
         return estimator_fit
 
@@ -672,510 +943,3 @@ class DNNModel(QSPRModelPyTorchGPU):
         X = self.convertToNumpy(X)
 
         return [estimator.predict(X)]
-    
-
-
-# KOD PRO INSPIRACI - CO MUSI!!! BYT IMPLEMENTOVANO!!!
-
-
-"""This module holds the base class for DNN models
-as well as fully connected NN subclass.
-"""
-
-import inspect
-from collections import defaultdict
-
-import numpy as np
-import torch
-from torch import nn, optim
-from torch.nn import functional as f
-from torch.utils.data import DataLoader, TensorDataset
-
-from ....logs import logger
-from ....models.monitors import BaseMonitor, FitMonitor
-
-
-class Base(nn.Module):
-    """Base structure for all classification/regression DNN models.
-
-    Mainly, it provides the general methods for training, evaluating model and
-    predicting the given data.
-
-    Attributes:
-        n_epochs (int):
-            (maximum) number of epochs to train the model
-        lr (float):
-            learning rate
-        batch_size (int):
-            batch size
-        patience (int):
-            number of epochs to wait before early stop if no progress on validation
-            set score, if patience = -1, always train to `n_epochs`
-        tol (float):
-            minimum absolute improvement of loss necessary to count as progress
-            on best validation score
-        device (torch.device):
-            device to run the model on
-        gpus (list):
-            list of gpus to run the model on
-    """
-
-    def __init__(  # nejak done
-        self,
-        device: str,
-        gpus: list[int],
-        n_epochs: int = 1000,
-        lr: float = 1e-4,
-        batch_size: int = 256,
-        patience: int = 50,
-        tol: float = 0,
-    ):
-        """Initialize the DNN model.
-
-        Args:
-            device (str):
-                device to run the model on
-            gpus (list):
-                list of gpus to run the model on
-            n_epochs (int):
-                (maximum) number of epochs to train the model
-            lr (float):
-                learning rate
-            batch_size (int):
-                batch size
-            patience (int):
-                number of epochs to wait before early stop if no progress on validation
-                set score, if patience = -1, always train to `n_epochs`
-            tol (float):
-                minimum absolute improvement of loss necessary to count as progress
-                on best validation score
-        """
-        super().__init__()
-        self.n_epochs = n_epochs
-        self.lr = lr
-        self.batch_size = batch_size
-        self.patience = patience
-        self.tol = tol
-        self.device = torch.device(device)
-        self.gpus = gpus
-        if len(self.gpus) > 1:
-            logger.warning(
-                f"At the moment multiple gpus is not possible: "
-                f"running DNN on gpu: {gpus[0]}."
-            )
-
-    def fit(   # nejak done
-        self,
-        X_train,
-        y_train,
-        X_valid=None,
-        y_valid=None,
-        monitor: FitMonitor | None = None,
-    ) -> int:
-        """Training the DNN model.
-
-        Training is, similar to the scikit-learn or Keras style.
-        It saves the optimal value of parameters.
-
-        Args:
-            X_train (np.ndarray or pd.Dataframe):
-                training data (m X n), m is the No. of samples, n is the No. of features
-            y_train (np.ndarray or pd.Dataframe):
-                training target (m X l), m is the No. of samples, l is
-                the No. of classes or tasks
-            X_valid (np.ndarray or pd.Dataframe):
-                validation data (m X n), m is the No. of samples, n is
-                the No. of features
-            y_valid (np.ndarray or pd.Dataframe):
-                validation target (m X l), m is the No. of samples, l is
-                the No. of classes or tasks
-            monitor (FitMonitor):
-                monitor to use for training, if None, use base monitor
-
-        Returns:
-            int:
-                the epoch number when the optimal model is saved
-        """
-        self.to(self.device)
-        monitor = BaseMonitor() if monitor is None else monitor
-        train_loader = self.getDataLoader(X_train, y_train)
-        valid_loader = None
-        # if validation data is provided, use early stopping
-        if X_valid is not None and y_valid is not None:
-            valid_loader = self.getDataLoader(X_valid, y_valid)
-            patience = self.patience
-        else:
-            patience = -1
-        if "optim" in self.__dict__:
-            optimizer = self.optim
-        else:
-            optimizer = optim.Adam(self.parameters(), lr=self.lr)
-        # record the minimum loss value based on the calculation of the
-        # loss function by the current epoch
-        best_loss = np.inf
-        best_weights = self.state_dict()
-        last_save = 0  # record the epoch when optimal model is saved.
-        for epoch in range(self.n_epochs):
-            monitor.onEpochStart(epoch)
-            loss = None
-            # decrease learning rate over the epochs
-            for param_group in optimizer.param_groups:
-                param_group["lr"] = self.lr * (1 - 1 / self.n_epochs) ** (epoch * 10)
-            for i, (Xb, yb) in enumerate(train_loader):
-                monitor.onBatchStart(i)
-                # Batch of target tenor and label tensor
-                Xb, yb = Xb.to(self.device), yb.to(self.device)
-                optimizer.zero_grad()
-                # predicted probability tensor
-                y_ = self(Xb, is_train=True)
-                # ignore all the NaN values
-                ix = yb == yb
-                if self.n_class > 1:
-                    yb, y_ = yb[ix], y_[ix[:, -1], :]
-                else:
-                    yb, y_ = yb[ix], y_[ix]
-                # loss function calculation based on predicted tensor and label tensor
-                if self.n_class > 1:
-                    loss = self.criterion(y_, yb.long())
-                else:
-                    loss = self.criterion(y_, yb)
-                loss.backward()
-                optimizer.step()
-                monitor.onBatchEnd(i, float(loss))
-            if patience == -1:
-                monitor.onEpochEnd(epoch, loss.item())
-            else:
-                # loss value on validation set based on which optimal model is saved.
-                loss_valid = self.evaluate(valid_loader)
-                if loss_valid + self.tol < best_loss:
-                    best_weights = self.state_dict()
-                    best_loss = loss_valid
-                    last_save = epoch
-                elif epoch - last_save > patience:  # early stop
-                    break
-                monitor.onEpochEnd(epoch, loss.item(), loss_valid)
-        if patience == -1:
-            best_weights = self.state_dict()
-        self.load_state_dict(best_weights)
-        return self, last_save
-
-    def evaluate(self, loader) -> float:  # provest!
-        """Evaluate the performance of the DNN model.
-
-        Args:
-            loader (torch.util.data.DataLoader):
-                data loader for test set,
-                including m X n target FloatTensor and l X n label FloatTensor
-                (m is the No. of sample, n is the No. of features, l is the
-                No. of classes or tasks)
-
-        Return:
-            loss (float):
-                the average loss value based on the calculation of loss
-                function with given test set.
-        """
-        self.to(self.device)
-        loss = 0
-        for Xb, yb in loader:
-            Xb, yb = Xb.to(self.device), yb.to(self.device)
-            y_ = self.forward(Xb)
-            ix = yb == yb
-            if self.n_class > 1:
-                yb, y_ = yb[ix], y_[ix[:, -1], :]
-            else:
-                yb, y_ = yb[ix], y_[ix]
-            if self.n_class > 1:
-                loss += self.criterion(y_, yb.long()).item()
-            else:
-                loss += self.criterion(y_, yb).item()
-        loss = loss / len(loader)
-        return loss
-
-    def predict(self, X_test) -> np.ndarray:
-        """Predicting the probability of each sample in the given dataset.
-
-        Args:
-            X_test (ndarray):
-                m X n target array (m is the No. of sample,
-                n is the No. of features)
-
-        Returns:
-            score (ndarray):
-                probability of each sample in the given dataset,
-                it is an m X l FloatTensor (m is the No. of sample, l is the
-                No. of classes or tasks.)
-        """
-        self.to(self.device)
-        loader = self.getDataLoader(X_test)
-        score = []
-        for X_b in loader:
-            X_b = X_b.to(self.device)
-            y_ = self.forward(X_b)
-            score.append(y_.detach().cpu())
-        score = torch.cat(score, dim=0).numpy()
-        return score
-
-    @classmethod
-    def _get_param_names(cls) -> list:
-        """Get the class parameter names.
-
-        Function copied from sklearn.base_estimator!
-
-        Returns:
-            parameter names (list): list of the class parameter names.
-        """
-        init_signature = inspect.signature(cls.__init__)
-        parameters = [
-            p
-            for p in init_signature.parameters.values()
-            if p.name != "self" and p.kind != p.VAR_KEYWORD
-        ]
-        return sorted([p.name for p in parameters])
-
-    def get_params(self, deep=True) -> dict:
-        """Get parameters for this estimator.
-
-        Function copied from sklearn.base_estimator!
-
-        Args:
-            deep (bool): If True, will return the parameters for this estimator
-
-        Returns:
-            params (dict): Parameter names mapped to their values.
-        """
-        out = {}
-        for key in self._get_param_names():
-            value = getattr(self, key)
-            if deep and hasattr(value, "get_params"):
-                deep_items = value.get_params().items()
-                out.update((key + "__" + k, val) for k, val in deep_items)
-            out[key] = value
-        return out
-
-    def set_params(self, **params) -> "Base":
-        """Set the parameters of this estimator.
-
-        Function copied from sklearn.base_estimator!
-        The method works on simple estimators as well as on nested objects
-        (such as :class:`~sklearn.pipeline.Pipeline`). The latter have
-        parameters of the form ``<component>__<parameter>`` so that it's
-        possible to update each component of a nested object.
-
-        Args:
-            **params : dict Estimator parameters.
-
-        Returns:
-            self : estimator instance
-        """
-        if not params:
-            # Simple optimization to gain speed (inspect is slow)
-            return self
-        valid_params = self.get_params(deep=True)
-        # grouped by prefix
-        nested_params = defaultdict(dict)
-        for key, value in params.items():
-            key, delim, sub_key = key.partition("__")
-            if key not in valid_params:
-                local_valid_params = self._get_param_names()
-                raise ValueError(
-                    f"Invalid parameter {key!r} for estimator {self}. "
-                    f"Valid parameters are: {local_valid_params!r}."
-                )
-            if delim:
-                nested_params[key][sub_key] = value
-            else:
-                setattr(self, key, value)
-                valid_params[key] = value
-        for key, sub_params in nested_params.items():
-            valid_params[key].set_params(**sub_params)
-        return self
-
-    def getDataLoader(self, X, y=None):
-        """Convert data to tensors and get generator over dataset with dataloader.
-
-        Args:
-            X (numpy 2d array): input dataset
-            y (numpy 1d column vector): output data
-        """
-        # if pandas dataframe is provided, convert it to numpy array
-        if hasattr(X, "values"):
-            X = X.values
-        if y is not None and hasattr(y, "values"):
-            y = y.values
-        if y is None:
-            tensordataset = torch.Tensor(X)
-        else:
-            tensordataset = TensorDataset(torch.Tensor(X), torch.Tensor(y))
-        return DataLoader(tensordataset, batch_size=self.batch_size)
-
-
-class STFullyConnected(Base):
-    """Single task DNN classification/regression model.
-
-    It contains four fully connected layers between which are
-    dropout layers for robustness.
-
-    Attributes:
-        n_dim (int): the No. of columns (features) for input tensor
-        n_class (int): the No. of columns (classes) for output tensor.
-        device (torch.cude): device to run the model on
-        gpus (list): list of gpu ids to run the model on
-        n_epochs (int): max number of epochs
-        lr (float): neural net learning rate
-        batch_size (int): batch size for training
-        patience (int): early stopping patience
-        tol (float): early stopping tolerance
-        is_reg (bool): whether the model is for regression or classification
-        neurons_h1 (int): No. of neurons in the first hidden layer
-        neurons_hx (int): No. of neurons in the second hidden layer
-        extra_layer (bool): whether to add an extra hidden layer
-        dropout_frac (float): dropout fraction
-        criterion (torch.nn.Module): the loss function
-        dropout (torch.nn.Module): the dropout layer
-        fc0 (torch.nn.Module): the first fully connected layer
-        fc1 (torch.nn.Module): the second fully connected layer
-        fc2 (torch.nn.Module): the third fully connected layer
-        fc3 (torch.nn.Module): the fourth fully connected layer
-        activation (torch.nn.Module): the activation function
-    """
-
-    def __init__(
-        self,
-        n_dim,
-        n_class,
-        device,
-        gpus,
-        n_epochs=100,
-        lr=None,
-        batch_size=256,
-        patience=50,
-        tol=0,
-        is_reg=True,
-        neurons_h1=256,
-        neurons_hx=128,
-        extra_layer=False,
-        dropout_frac=0.25,
-    ):
-        """Initialize the STFullyConnected model.
-
-        Args:
-            n_dim (int):
-                the No. of columns (features) for input tensor
-            n_class (int):
-                the No. of columns (classes) for output tensor.
-            device (torch.cude):
-                device to run the model on
-            gpus (list):
-                list of gpu ids to run the model on
-            n_epochs (int):
-                max number of epochs
-            lr (float):
-                neural net learning rate
-            batch_size (int):
-                batch size
-            patience (int):
-                number of epochs to wait before early stop if no progress on
-                validation set score, if patience = -1, always train to n_epochs
-            tol (float):
-                minimum absolute improvement of loss necessary to
-                count as progress on best validation score
-            is_reg (bool, optional):
-                Regression model (True) or Classification model (False)
-            neurons_h1 (int):
-                number of neurons in first hidden layer
-            neurons_hx (int):
-                number of neurons in other hidden layers
-            extra_layer (bool):
-                add third hidden layer
-            dropout_frac (float):
-                dropout fraction
-        """
-        if not lr:
-            lr = 1e-4 if is_reg else 1e-5
-        super().__init__(
-            device=device,
-            gpus=gpus,
-            n_epochs=n_epochs,
-            lr=lr,
-            batch_size=batch_size,
-            patience=patience,
-            tol=tol,
-        )
-        self.n_dim = n_dim
-        self.is_reg = is_reg
-        self.n_class = n_class if not self.is_reg else 1
-        self.neurons_h1 = neurons_h1
-        self.neurons_hx = neurons_hx
-        self.extra_layer = extra_layer
-        self.dropout_frac = dropout_frac
-        self.dropout = None
-        self.fc0 = None
-        self.fc1 = None
-        self.fc2 = None
-        self.fc3 = None
-        self.activation = None
-        self.criterion = None
-        self.initModel()
-
-    def initModel(self):
-        """Define the layers of the model."""
-        self.dropout = nn.Dropout(self.dropout_frac)
-        self.fc0 = nn.Linear(self.n_dim, self.neurons_h1)
-        self.fc1 = nn.Linear(self.neurons_h1, self.neurons_hx)
-        if self.extra_layer:
-            self.fc2 = nn.Linear(self.neurons_hx, self.neurons_hx)
-        self.fc3 = nn.Linear(self.neurons_hx, self.n_class)
-        if self.is_reg:
-            # loss function for regression
-            self.criterion = nn.MSELoss()
-        elif self.n_class == 1:
-            # loss and activation function of output layer for binary classification
-            self.criterion = nn.BCELoss()
-            self.activation = nn.Sigmoid()
-        else:
-            # loss and activation function of output layer for multiple classification
-            self.criterion = nn.CrossEntropyLoss()
-            self.activation = nn.Softmax(dim=1)
-
-    def set_params(self, **params) -> "STFullyConnected":
-        """Set parameters and re-initialize model.
-
-        Args:
-            **params: parameters to be set
-
-        Returns:
-            self (STFullyConnected): the model itself
-        """
-        super().set_params(**params)
-        self.initModel()
-        return self
-
-    def forward(self, X, is_train=False) -> torch.Tensor:
-        """Invoke the class directly as a function.
-
-        Args:
-            X (FloatTensor):
-                m X n FloatTensor, m is the No. of samples, n is
-                the No. of features.
-            is_train (bool, optional):
-                is it invoked during training process (True) or
-                just for prediction (False)
-        Returns:
-            y (FloatTensor): m X n FloatTensor, m is the No. of samples,
-                n is the No. of classes
-        """
-        y = f.relu(self.fc0(X))
-        if is_train:
-            y = self.dropout(y)
-        y = f.relu(self.fc1(y))
-        if self.extra_layer:
-            if is_train:
-                y = self.dropout(y)
-            y = f.relu(self.fc2(y))
-        if is_train:
-            y = self.dropout(y)
-        if self.is_reg:
-            y = self.fc3(y)
-        else:
-            y = self.activation(self.fc3(y))
-        return y

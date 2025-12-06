@@ -2,6 +2,8 @@ import os
 from typing import Type
 from unittest import TestCase, skipIf
 
+import torch.nn.functional as F
+
 import chemprop
 import pandas as pd
 import torch
@@ -12,6 +14,8 @@ from sklearn.impute import SimpleImputer
 from sklearn.model_selection import ShuffleSplit
 
 from qsprpred.data.descriptors.sets import SmilesDesc
+from qsprpred.data.descriptors.fingerprints import MorganFP
+
 from qsprpred.data.sampling.splits import RandomSplit
 from qsprpred.extra.gpu.utils.parallel import TorchJITGenerator
 from qsprpred.tasks import ModelTasks, TargetTasks
@@ -269,6 +273,7 @@ class NeuralNetGGNN(ModelDataSetsPathMixIn, ModelCheckMixIn, TestCase):
             parameters: Parameters to use.
             random_state: Random seed to use for random operations.
         """
+        
         return GGNNModel(
             base_dir=self.generatedModelsPath,
             alg=alg,
@@ -277,7 +282,7 @@ class NeuralNetGGNN(ModelDataSetsPathMixIn, ModelCheckMixIn, TestCase):
             gpus=GPUS,
             patience=3,
             tol=0.02,
-            random_state=random_state,
+            random_state=random_state
         )
 
     @parameterized.expand(
@@ -294,7 +299,7 @@ class NeuralNetGGNN(ModelDataSetsPathMixIn, ModelCheckMixIn, TestCase):
         )
         ]
         + [
-            (
+                (
                     f"{alg_name}_{task}_{'_'.join(map(str, random_state))}",
                     task,
                     alg_name,
@@ -328,11 +333,16 @@ class NeuralNetGGNN(ModelDataSetsPathMixIn, ModelCheckMixIn, TestCase):
             th: Threshold to use for classification models.
             random_state: Seed to be used for random operations.
         """
+
         # initialize dataset
         dataset = self.createLargeTestDataSet(
             name=f"{alg_name}_{task}",
             target_props=[{"name": "CL", "task": task, "th": th}],
-            preparation_settings=self.getDefaultPrep(),
+            preparation_settings=None
+        )
+        dataset.prepareDataset(
+            feature_calculators=[SmilesDesc()],
+            split=RandomSplit(test_fraction=0.1, dataset=dataset),
         )
 
         # initialize model for training from class
@@ -346,11 +356,13 @@ class NeuralNetGGNN(ModelDataSetsPathMixIn, ModelCheckMixIn, TestCase):
         predictor = GGNNModel(
             name=alg_name, base_dir=model.baseDir, random_state=random_state[0]
         )
+        self.predictorTest(predictor, dataset=dataset)
 
         # test if the results are (not) equal if the random state is the (not) same
         # and check if the output is the same before and after saving and loading
         if random_state[0] is not None:
             model.cleanFiles()
+            predictor.cleanFiles()
             comparison_model = self.getModel(
                 name=alg_name,
                 alg=alg,
@@ -660,10 +672,73 @@ class ChemPropTest(ModelDataSetsPathMixIn, ModelCheckMixIn, TestCase):
 class TestNNMonitoring(MonitorsCheckMixIn, TestCase):
     """This class holds the tests for the monitoring classes."""
 
-    models = (
-        (DNNModel,"STFullyConnected"),
-        (GGNNModel,"GGNN")
-    )
+    def setUp(self):
+        super().setUp()
+        self.setUpPaths()
+
+    @property
+    def gridFile(self):
+        """Return the path to the grid file with test
+        search spaces for hyperparameter optimization.
+        """
+        return f"{os.path.dirname(__file__)}/test_files/search_space_test.json"
+
+    def testBaseMonitor(self):
+        model = DNNModel(
+            base_dir=self.generatedModelsPath,
+            name="STFullyConnected",
+            gpus=GPUS,
+            patience=3,
+            tol=0.02,
+            random_state=42,
+        )
+        self.runMonitorTest(
+            model,
+            self.createLargeTestDataSet(preparation_settings=self.getDefaultPrep()),
+            BaseMonitor,
+            self.baseMonitorTest,
+            True,
+        )
+
+    def testFileMonitor(self):
+        model = DNNModel(
+            base_dir=self.generatedModelsPath,
+            name="STFullyConnected",
+            gpus=GPUS,
+            patience=3,
+            tol=0.02,
+            random_state=42,
+        )
+        self.runMonitorTest(
+            model,
+            self.createLargeTestDataSet(preparation_settings=self.getDefaultPrep()),
+            BaseMonitor,
+            self.baseMonitorTest,
+            True,
+        )
+
+    def testListMonitor(self):
+        """Test the list monitor"""
+        model = DNNModel(
+            base_dir=self.generatedModelsPath,
+            name="STFullyConnected",
+            gpus=GPUS,
+            patience=3,
+            tol=0.02,
+            random_state=42,
+        )
+        self.runMonitorTest(
+            model,
+            self.createLargeTestDataSet(preparation_settings=self.getDefaultPrep()),
+            ListMonitor,
+            self.listMonitorTest,
+            True,
+            [BaseMonitor(), FileMonitor()],
+        )
+
+
+class TestGGNNMonitoring(MonitorsCheckMixIn, TestCase):
+    """This class holds the tests for the monitoring classes."""
 
     def setUp(self):
         super().setUp()
@@ -677,61 +752,75 @@ class TestNNMonitoring(MonitorsCheckMixIn, TestCase):
         return f"{os.path.dirname(__file__)}/test_files/search_space_test.json"
 
     def testBaseMonitor(self):
-        for pair in TestNNMonitoring.models:
-            dnnmodel, algname = pair
-            model = dnnmodel(
-                base_dir=self.generatedModelsPath,
-                name=algname,
-                gpus=GPUS,
-                patience=3,
-                tol=0.02,
-                random_state=42,
-            )
-            self.runMonitorTest(
-                model,
-                self.createLargeTestDataSet(preparation_settings=self.getDefaultPrep()),
-                BaseMonitor,
-                self.baseMonitorTest,
-                True,
+        model = GGNNModel(
+            base_dir=self.generatedModelsPath,
+            name="GGNN",
+            gpus=GPUS,
+            patience=3,
+            tol=0.02,
+            random_state=42,
+        )
+
+        dataset = self.createLargeTestDataSet()
+        dataset.prepareDataset(
+            feature_calculators=[SmilesDesc()],
+            split=RandomSplit(test_fraction=0.5, dataset=dataset)
             )
 
+        self.runMonitorTest(
+            model,
+            dataset,
+            BaseMonitor,
+            self.baseMonitorTest,
+            True,
+        )
+
     def testFileMonitor(self):
-        for pair in TestNNMonitoring.models:
-            dnnmodel, algname = pair
-            model = dnnmodel(
-                base_dir=self.generatedModelsPath,
-                name=algname,
-                gpus=GPUS,
-                patience=3,
-                tol=0.02,
-                random_state=42,
+        model = GGNNModel(
+            base_dir=self.generatedModelsPath,
+            name="GGNN",
+            gpus=GPUS,
+            patience=3,
+            tol=0.02,
+            random_state=42,
+        )
+
+        dataset = self.createLargeTestDataSet()
+        dataset.prepareDataset(
+            feature_calculators=[SmilesDesc()],
+            split=RandomSplit(test_fraction=0.5, dataset=dataset)
             )
-            self.runMonitorTest(
-                model,
-                self.createLargeTestDataSet(preparation_settings=self.getDefaultPrep()),
-                BaseMonitor,
-                self.baseMonitorTest,
-                True,
-            )
+        
+        self.runMonitorTest(
+            model,
+            dataset,
+            FileMonitor,
+            self.baseMonitorTest,
+            True,
+        )
 
     def testListMonitor(self):
         """Test the list monitor"""
-        for pair in TestNNMonitoring.models:
-            dnnmodel, algname = pair
-            model = dnnmodel(
-                base_dir=self.generatedModelsPath,
-                name=algname,
-                gpus=GPUS,
-                patience=3,
-                tol=0.02,
-                random_state=42,
-            )
-            self.runMonitorTest(
-                model,
-                self.createLargeTestDataSet(preparation_settings=self.getDefaultPrep()),
-                ListMonitor,
-                self.listMonitorTest,
-                True,
-                [BaseMonitor(), FileMonitor()],
-            )
+        model = GGNNModel(
+            base_dir=self.generatedModelsPath,
+            name="GGNN",
+            gpus=GPUS,
+            patience=3,
+            tol=0.02,
+            random_state=42,
+        )
+
+        dataset = self.createLargeTestDataSet()
+        dataset.prepareDataset(
+            feature_calculators=[SmilesDesc()],
+            split=RandomSplit(test_fraction=0.5, dataset=dataset)
+        )
+        self.runMonitorTest(
+            model,
+            dataset,
+            ListMonitor,
+            self.listMonitorTest,
+            True,
+            [BaseMonitor(), FileMonitor()],
+        )
 

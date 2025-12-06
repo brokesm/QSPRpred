@@ -6,6 +6,16 @@
          "neurons_h1" : ["int", 50, 200],
          "neurons_hx" : ["int", 50, 200],
          "extra_layer": ["categorical", [true, false]]}, "bayes"],
+["GGNN", {
+        "activation_in":["selu","tanh","relu","leaky_relu"],
+        "optim":["adam","adamw","sgd","rmsprop"],
+        "scheduler":["exp","step","multi_step","reduce_on_plateau","cosine"]
+        }, "grid"],
+["GGNN", {
+        "activation_in":["categorical",["selu","tanh","relu","leaky_relu"]],
+        "optim":["categorical",["adam","adamw","sgd","rmsprop"]],
+        "scheduler":["categorical",["exp","step","multi_step","reduce_on_plateau","cosine"]]
+        }, "bayes"],
 ["MoleculeModel", {"hidden_size": [50, 200]}, "grid"],
 ["MoleculeModel", {"hidden_size": ["int", 50, 200]}, "bayes"]
 ]
