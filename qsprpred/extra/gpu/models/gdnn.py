@@ -534,10 +534,10 @@ class GGNN(nn.Module):
         self.to(self.device)
         monitor = BaseMonitor() if monitor is None else monitor
 
-        train_loader = self.getLoader(X, y, batch_size=self.batch_size, schuffle=False, include_labels=True)
+        train_loader = self.getLoader(X, y, batch_size=self.batch_size, shuffle=True, include_labels=True)
         val_loader = None
         if (Xval is not None and yval is not None):
-            val_loader = self.getLoader(Xval, yval, batch_size=self.batch_size, schuffle=False, include_labels=True)
+            val_loader = self.getLoader(Xval, yval, batch_size=self.batch_size, shuffle=True, include_labels=True)
             patience = self.patience
         else:
             patience = -1
@@ -596,7 +596,7 @@ class GGNN(nn.Module):
         return self, last_save
     
     def predict(self, X):
-        test_loader = self.getLoader(X, y=None, batch_size=self.batch_size, schuffle=False, include_labels=False)
+        test_loader = self.getLoader(X, y=None, batch_size=self.batch_size, shuffle=True, include_labels=False)
         self.eval()
         score = []
         with torch.no_grad():      
