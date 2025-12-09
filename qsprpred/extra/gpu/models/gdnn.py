@@ -488,7 +488,7 @@ class GGNN(nn.Module):
             return batched_graph
 
 
-    def getLoader(self, X, y, batch_size, schuffle=False, include_labels=False):
+    def getLoader(self, X, y, batch_size, shuffle=True, include_labels=False):
         graphs, labels = [], []
         for i in range(len(X)):
 
@@ -515,14 +515,14 @@ class GGNN(nn.Module):
             loader = GraphDataLoader(
                 list(zip(graphs, labels)),
                 batch_size=batch_size,
-                shuffle=True if schuffle else False,
+                shuffle=True if shuffle else False,
                 collate_fn=self.collate,
                 num_workers=0)
         else:
             loader = GraphDataLoader(
                 list(zip(graphs)),
                 batch_size=batch_size,
-                shuffle=True if schuffle else False,
+                shuffle=True if shuffle else False,
                 collate_fn=self.collate,
                 num_workers=0)
         return loader
